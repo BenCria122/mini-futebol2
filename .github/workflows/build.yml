@@ -1,0 +1,119 @@
+name: Build AAB
+
+on:
+  workflow_dispatch:
+
+env:
+  APP_NAME: "Mini Soccer Simulator"
+  APP_ID: "com.benjamin.minisoccersimulator"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Preparar arquivos do jogo e icones
+        run: |
+          set -e
+          test -f index.html || test -f www/index.html || { echo "::error::Faltou o arquivo index.html"; exit 1; }
+          mkdir -p www assets
+          [ -f index.html ] && cp index.html www/index.html
+          for f in icon-only icon-foreground icon-background; do
+            [ -f "$f.png" ] && cp "$f.png" "assets/$f.png" || true
+          done
+          ls -la www assets
+
+      - name: Instalar Capacitor e criar projeto Android
+        run: |
+          set -e
+          npm init -y
+          npm i @capacitor/core @capacitor/cli @capacitor/android
+          npm i -D @capacitor/assets
+          npx cap init "$APP_NAME" "$APP_ID" --web-dir www
+          npx cap add android
+
+      - name: Gerar icones
+        run: |
+          npx capacitor-assets generate --android --iconBackgroundColor '#1f8f4e' --iconBackgroundColorDark '#1f8f4e' || echo "::warning::Nao consegui gerar os icones, o app vai usar o icone padrao"
+
+      - name: Ajustar app (paisagem, tela cheia, versao)
+        run: |
+          set -e
+          MANIFEST=android/app/src/main/AndroidManifest.xml
+          sed -i '0,/<activity/s//<activity android:screenOrientation="sensorLandscape"/' "$MANIFEST"
+          grep -q sensorLandscape "$MANIFEST" || { echo "::error::Nao consegui travar em paisagem"; exit 1; }
+
+          STYLES=android/app/src/main/res/values/styles.xml
+          sed -i '/name="AppTheme.NoActionBar"/a\        <item name="android:windowFullscreen">true</item>\n        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>' "$STYLES"
+          grep -q windowFullscreen "$STYLES" || echo "::warning::Tela cheia por tema nao aplicada"
+
+          python3 - <<'PY'
+          import glob,re
+          fs=glob.glob('android/app/src/main/java/**/MainActivity.java',recursive=True)
+          if not fs:
+              print('::warning::MainActivity.java nao encontrado')
+          else:
+              p=fs[0]; s=open(p).read()
+              code='''extends BridgeActivity {
+              @Override
+              public void onWindowFocusChanged(boolean hasFocus) {
+                  super.onWindowFocusChanged(hasFocus);
+                  if (hasFocus) {
+                      androidx.core.view.WindowInsetsControllerCompat c = androidx.core.view.WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView());
+                      c.setSystemBarsBehavior(androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                      c.hide(androidx.core.view.WindowInsetsCompat.Type.systemBars());
+                  }
+              }
+          }'''
+              n=re.sub(r'extends BridgeActivity\s*\{\s*\}',code,s)
+              if n==s: print('::warning::Modo imersivo nao aplicado')
+              else: open(p,'w').write(n)
+          PY
+
+          sed -i -E "s/(versionCode[ =]+)[0-9]+/\1${{ github.run_number }}/" android/app/build.gradle
+          grep -n versionCode android/app/build.gradle
+          npx cap sync android
+
+      - name: Compilar AAB
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew bundleRelease --no-daemon
+
+      - name: Assinar AAB
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          set -e
+          mkdir -p saida
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > saida/upload-keystore.jks
+            PASS="$KEYSTORE_PASSWORD"
+            echo "Usando a chave que voce cadastrou nos Secrets."
+          else
+            PASS=$(openssl rand -hex 12)
+            keytool -genkeypair -keystore saida/upload-keystore.jks -alias upload -keyalg RSA -keysize 2048 -validity 10000 -storepass "$PASS" -keypass "$PASS" -dname "CN=Benjamin, O=Mini Soccer Simulator, C=BR"
+            printf 'Arquivo da chave: upload-keystore.jks\nAlias: upload\nSenha: %s\nGUARDE ESTE ARQUIVO E ESTA SENHA.\n' "$PASS" > saida/SENHA-DA-CHAVE.txt
+            echo "Chave nova criada. Guarde a pasta de saida."
+          fi
+          AAB=$(find android/app/build/outputs/bundle/release -name '*.aab' | head -1)
+          cp "$AAB" saida/app-release.aab
+          jarsigner -sigalg SHA256withRSA -digestalg SHA-256 -keystore saida/upload-keystore.jks -storepass "$PASS" saida/app-release.aab upload
+          jarsigner -verify saida/app-release.aab | head -3
+          ls -la saida
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mini-soccer-simulator-aab
+          path: saida/
